@@ -1,0 +1,15 @@
+{
+    "name": "sonarqube-test",
+    "version": "1.0.0",
+    "description": "Basic JavaScript App for SonarQube Integration Testing",
+    "main": "app.js",
+    "dependencies": {
+      "express": "^4.17.1"
+    },
+    "devDependencies": {},
+    "scripts": {
+      "start": "node app.js"
+    },
+    "author": "",
+    "license": "ISC"
+  }  

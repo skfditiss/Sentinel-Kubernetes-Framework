@@ -1,0 +1,192 @@
+
+pipeline {
+    agent any
+
+    environment {
+        IMAGE_NAME = "skfditiss/zta"
+        IMAGE_TAG = "latest"
+        KUBE_NAMESPACE = "default"
+        CHART_NAME = "zta"
+        SONARQUBE_URL = "http://localhost:9000"
+        PROMETHEUS_URL = "http://localhost:9090"
+        GRAFANA_URL = "http://localhost:3000"
+        GITHUB_CREDENTIALS_ID = "github"  
+        SONAR_SCANNER_HOME = '/opt/sonar-scanner'  
+        PATH = "${SONAR_SCANNER_HOME}/bin:${env.PATH}"
+        SONAR_TOKEN = "squ_0520eea0a041ee90b18e77560d944458471278c0"
+        PUSHGATEWAY_URL = "http://$(minikube ip):9091"
+    }
+
+    stages {
+        stage('Clone Repository') {
+            steps {
+                script {
+                    cleanWs()
+                    withCredentials([usernamePassword(credentialsId: GITHUB_CREDENTIALS_ID, usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_TOKEN')]) {
+                        sh 'git config --global credential.helper store'
+                        sh 'echo "https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com" > ~/.git-credentials'
+                        sh 'git clone https://github.com/skfditiss/zta.git'
+                        sh 'cd zta && git checkout main && git pull origin main'
+                    }
+                }
+            }
+        }
+
+        stage('Start Minikube') {
+            steps {
+                script {
+                    def minikubeStatus = sh(script: "minikube status | grep 'host: Running' || echo 'stopped'", returnStdout: true).trim()
+                    if (minikubeStatus == 'stopped') {
+                        echo "Starting Minikube..."
+                        sh '''
+                            export MINIKUBE_HOME=$HOME/.minikube
+                            export KUBECONFIG=$HOME/.kube/config
+                            sudo minikube start --driver=none --memory=8000mb --cpus=3 --force
+                        '''
+                    } else {
+                        echo "Minikube is already running."
+                    }
+                    sh 'eval $(minikube docker-env)'
+                    sh 'echo "Minikube IP: $(minikube ip)"'
+                    sh 'kubectl config use-context minikube'
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} -f zta/Dockerfile ."
+                }
+            }
+        }
+
+        stage('Deploy SonarQube') {
+            steps {
+                script {
+                    sh 'kubectl apply -f ./zta/deployment/sonarqube.yaml'
+                    sh 'kubectl apply -f ./zta/deployment/sonarqube-service.yaml'
+                }
+            }
+        }
+
+        stage('Configure Prometheus to Scrape SonarQube Metrics') {
+            steps {
+                script {
+                    sh '''
+                    cat <<EOF | kubectl apply -f -
+                    apiVersion: monitoring.coreos.com/v1
+                    kind: ServiceMonitor
+                    metadata:
+                      name: sonarqube
+                      labels:
+                        release: prometheus
+                    spec:
+                      selector:
+                        matchLabels:
+                          app: sonarqube
+                      endpoints:
+                      - port: web
+                        path: /metrics
+                    EOF
+                    '''
+                }
+            }
+        }
+
+        stage('SonarQube Scan') {
+            steps {
+                script {
+                    withSonarQubeEnv('sonar') {
+                        sh "sonar-scanner -Dsonar.projectKey=zta -Dsonar.sources=. -Dsonar.host.url=${SONARQUBE_URL} -Dsonar.login=${SONAR_TOKEN}"
+                    }
+                }
+            }
+        }
+
+        stage('Trivy Security Scan & Push to Prometheus') {
+            steps {
+                script {
+                    sh '''
+                    trivy image --format json ${IMAGE_NAME}:${IMAGE_TAG} > trivy-results.json
+                    VULN_COUNT=$(jq '[.Results[].Vulnerabilities | length] | add' trivy-results.json)
+                    echo "trivy_vulnerabilities_total ${VULN_COUNT}" > trivy-metrics.prom
+                    curl -X POST --data-binary @trivy-metrics.prom ${PUSHGATEWAY_URL}/metrics/job/trivy_scan
+                    '''
+                }
+            }
+        }
+
+        stage('Push Docker Image to DockerHub') {
+            steps {
+                withDockerRegistry([credentialsId: 'dockerhub_idpass', url: 'https://index.docker.io/v1/']) {
+                    sh "docker push ${IMAGE_NAME}:${IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Deploy to Kubernetes with Helm') {
+            steps {
+                script {
+                    sh 'kubectl apply -f ./zta/deployment/prometheus-deployment.yaml'
+                    sh 'kubectl apply -f ./zta/deployment/prometheus-service.yaml'
+                    sh 'kubectl apply -f ./zta/deployment/prometheus-config.yaml'
+                    sh 'kubectl apply -f ./zta/deployment/grafana-deployment.yaml'
+                    sh 'kubectl apply -f ./zta/deployment/grafana-service.yaml'
+                    sh 'kubectl apply -f ./zta/deployment/grafana-datasource.yaml'
+                    sh 'kubectl apply -f ./zta/deployment/opa.yaml'
+                    sh 'kubectl apply -f ./zta/deployment/opa-service.yaml'
+                    sh 'kubectl apply -f ./zta/deployment/falco-deployment.yaml'
+                    sh 'kubectl apply -f ./zta/deployment/falco-service.yaml'
+                    sh 'kubectl apply -f ./zta/deployment/pushgateway.yaml'
+
+                    sh "helm upgrade --install ${CHART_NAME} ./zta/helm/ --namespace ${KUBE_NAMESPACE}"
+                }
+            }
+        }
+
+        stage('Expose Service & Verify Deployment') {
+            steps {
+                script {
+                    sh "kubectl get pods -n ${KUBE_NAMESPACE}"
+                    sh "kubectl get svc -n ${KUBE_NAMESPACE}"
+                    def minikubeIP = sh(script: "minikube ip", returnStdout: true).trim()
+                    echo "Access your application at: http://${minikubeIP}:30000/"
+                }
+            }
+        }
+
+        stage('Port Forwarding') {
+            steps {
+                script {
+                    sh "kubectl port-forward svc/zta-service 80:30000 -n ${KUBE_NAMESPACE} &"
+                    sh "kubectl port-forward svc/prometheus 9090:9090 -n ${KUBE_NAMESPACE} &"
+                    sh "kubectl port-forward svc/grafana 3000:3000 -n ${KUBE_NAMESPACE} &"
+                }
+            }
+        }
+
+        stage('Check Logs & Metrics') {
+            steps {
+                script {
+                    sh "kubectl port-forward svc/prometheus 9090:9090 --namespace=${KUBE_NAMESPACE} &"
+                    sh "curl ${PROMETHEUS_URL}/api/v1/query?query=up"
+                    sh "kubectl port-forward svc/grafana 3000:3000 --namespace=${KUBE_NAMESPACE} &"
+                    sh "curl ${GRAFANA_URL}/api/datasources/proxy/1/api/v1/query?query=up"
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo 'Pipeline execution completed.'
+        }
+        success {
+            echo 'Pipeline succeeded!'
+        }
+        failure {
+            echo 'Pipeline failed!'
+        }
+    }
+}
